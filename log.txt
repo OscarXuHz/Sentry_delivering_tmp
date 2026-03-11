@@ -1,0 +1,29 @@
+rviz: /build/ogre-1.9-kiU5_5/ogre-1.9-1.9.0+dfsg1/OgreMain/include/OgreAxisAlignedBox.h:251: void Ogre::AxisAlignedBox::setExtents(const Ogre::Vector3&, const Ogre::Vector3&): Assertion `(min.x <= max.x && min.y <= max.y && min.z <= max.z) && "The minimum corner of the box must be less than or equal to maximum corner"' failed.
+Aborted (core dumped)
+
+[WARN] [1773218129.366184497]: [Manager] start point, (x, y): (-1.96, -3.01)
+[WARN] [1773218129.366242660]: [Manager] receive target, (x, y): (-3.51, -2.66)
+[DEBUG] [1773218129.367033748]: [Topo]: m_graph before num: 199
+[WARN] [1773218129.377444146]: [Topo] Force-connected start node to guard 166 (dist=0.99m)
+[DEBUG] [1773218129.378095689]: [Topo]: dijkstra time: 0.000672
+[DEBUG] [1773218129.378106694]: [Topo]: topo search time: 0.011853
+[DEBUG] [1773218129.378113151]: [Topo]: m_graph num: 693
+optimized_path size: 3
+[WARN] [1773218129.379099167]: [Manager] reference_speed: (2.80)
+[DEBUG] [1773218129.379458969]: [LBFGS] invalid stp: nan
+[DEBUG] [1773218129.379513175]: [LBFGS] search direction d:      nan      nan      nan      nan      nan      nan -3105.71  1249.14 -332.652  103.894 -82.9235  232.801
+[WARN] [1773218129.379569051]: [Smooth Optimize] Optimization failed (A logic error (negative line-search step) occurred.), falling back to unsmoothed path (8 pts)
+[INFO] [1773218129.379586842]: [Smooth Resample] resample
+[INFO] [1773218129.379601800]: [Manager] optimizer generate time: 0.000514
+[WARN] [1773218129.379623082]: [Reference] path size : 8
+[WARN] [1773218129.379639409]: [Reference] path_length: 2.087018
+[DEBUG] [1773218129.379693286]: Trying to publish message of type [trajectory_generation/trajectoryPoly/ce0591a2dfb5f518ebf9900281fc0db2] on a publisher with type [trajectory_generation/trajectoryPoly/ce0591a2dfb5f518ebf9900281fc0db2]
+[INFO] [1773218129.379715061]: [FSM] trajectory generate time: 0.013590
+[INFO] [1773218129.379727056]: [FSM] trajectory desired time: 0.750000
+[INFO] [1773218129.380310961]: [Local Planner] rcv global trajectory
+[2026-03-11 16:35:29.424] [console] [info] Handle detection data, handle:50440384, dev_type:9, sn:47MDM630020291, cmd_port:56100  [general_command_handler.cpp] [HandleDetectionData] [319]
+[2026-03-11 16:35:29.424] [console] [info] Handle detection data, handle:1761716416, dev_type:9, sn:47MDM630020305, cmd_port:56100  [general_command_handler.cpp] [HandleDetectionData] [319]
+[INFO] [1773218129.435597559]: [LocalPlanner] MPC solver created (one-time init)
+[ERROR] [1773218129.436042289]: [LocalPlanner] SQP solver failed: [SqpSolver] Failed to solve QP - skipping this cycle
+[WARN] [1773218129.436193833]: [TrackingManager] solveNMPC failed, skipping this cycle
+[ERROR] [1773218129.535764036]: [LocalPlanner] SQP solver failed: [SqpSolver] Failed to solve QP - skipping this cycle
