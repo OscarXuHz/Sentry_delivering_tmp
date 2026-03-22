@@ -1990,3 +1990,349 @@ obstacle search in bridge areas, making the MPC completely blind there.
 | "MPC is not safe" rate | ~8.5% | **0%** |
 | Robot movement | stuck (serial closed) | **moving** (slight drift) |
 | Replans | 1/14s + periodic | periodic only (5s timer) |
+
+---
+
+## Fix 44: Velocity Heading + Barrier Strength (Session 2)
+
+**Date:** March 2026 — Session 2
+
+### Problem
+
+After Fixes 1-43, the robot still had issues:
+- MPC observation φ used the gimbal/LiDAR yaw directly, making the predicted
+  path follow the gimbal direction rather than the velocity direction
+- Collision barrier (μ=3.5) was too weak relative to Q=150 tracking cost
+- Collision distance threshold (0.09 = 0.3m effective) too small for dynamic
+  obstacles
+
+### Changes
+
+- **44a**: Changed MPC observation φ from `robot_lidar_yaw` (gimbal heading)
+  to `velocity_heading_` computed from odom twist atan2(vy, vx).
+  Added `velocity_heading_`, `velocity_heading_init_` member variables.
+  Used `std::remainder()` for smooth unwrapping.
+  **BUG**: Assumed odom twist was in world frame — it was actually in
+  body/gimbal frame (child_frame_id="aft_mapped").
+
+- **44b**: Increased barrier penalty: μ=3.5→40, δ=0.25→1.0
+
+- **44c**: Increased collision thresholds: static 0.09→0.36 (0.6m effective),
+  dynamic 0.25→0.64 (0.8m effective)
+
+- **44d**: Publish replan_flag during arrival_goal to keep topic alive
+
+---
+
+## Fix 45: Frame Rotation Corrections (Session 3, Part 1)
+
+**Date:** March 2026 — Session 3
+
+### Smoking Gun
+
+Two simultaneous frame errors from Fix 44a:
+1. **Input**: Body-frame twist used directly as world-frame → MPC φ state wrong
+2. **Output**: MPC world-frame vx/vy sent to gimbal-frame-expecting MCU
+
+### Changes
+
+**Files:** `trajectory_tracking/src/tracking_manager.cpp`
+
+- **45a**: Body→world rotation for twist BEFORE computing velocity heading.
+  ```cpp
+  double world_vx = body_vx * cos(yaw) - body_vy * sin(yaw);
+  double world_vy = body_vx * sin(yaw) + body_vy * cos(yaw);
+  ```
+
+- **45b**: World→gimbal rotation for MPC output BEFORE sending to MCU.
+  ```cpp
+  MPC_Control(0) =  vx_world * cos(yaw) + vy_world * sin(yaw);  // gimbal vx
+  MPC_Control(1) = -vx_world * sin(yaw) + vy_world * cos(yaw);  // gimbal vy
+  ```
+
+- **45c**: Lowered velocity heading threshold 0.15→0.03 m/s. Added
+  target-direction fallback when stationary. Added v_ctrl ≥ 0 clamp
+  (prevents backward motion except in DISPENSE mode).
+
+- **45d**: Wrapped velocity_heading_ to [-π,π] via `std::remainder`.
+
+- **45e**: Periodic debug logging with `[Fix45]` prefix showing both frames.
+
+### Results
+
+- Robot achieved 0.7-0.8 m/s (was near-zero before)
+- Frame rotations verified correct via debug logs
+- But: velocity heading unwrapping after gimbal rotation caused MPC oscillation
+- MPC still oscillated during gimbal yaw transitions
+
+---
+
+## Fix 46: Omnidirectional MPC + Narrow-Corridor Fixes (Session 3, Part 2)
+
+**Date:** March 2026 — Current session
+
+### Problems Identified
+
+1. **Predicted path followed gimbal yaw**: When gimbal faced backward, the MPC
+   predicted path went forward in gimbal direction, then curved to the reference.
+   Root cause: the velocity heading fell back to gimbal yaw when slow (< 0.03 m/s),
+   and the unicycle MPC model `dx/dt = v*cos(φ)` forced curving from the wrong
+   initial heading.
+
+2. **Predicted path disregarded reference in near field**: First few steps of
+   predicted trajectory diverged from reference because observation φ ≠ reference φ,
+   and the unicycle dynamics constrained how fast φ could change.
+
+3. **Polynomial trajectory timing bug**: 2-point paths (after re-anchoring or when
+   topo search fails) had segment time = `0.3 / desire_velocity` regardless of
+   actual segment length. For 8.3m segments, this gave 0.189s duration →
+   polynomial finished instantly → entire MPC reference collapsed to goal position
+   → refGap=8m → zero effective reference speed.
+
+4. **Collision thresholds too aggressive for narrow corridors**: Fix 44c increased
+   thresholds to 0.36/0.64 (0.6/0.8m effective). Combined with 0.3m map inflation,
+   total clearance was 0.9-1.1m from actual walls — impossible in the narrow
+   white-line topo corridors → MPC barrier deeply violated → v_ctrl = 0.
+
+### Changes
+
+**Files:**
+- `trajectory_tracking/src/tracking_manager.cpp`
+- `trajectory_tracking/include/.../SentryRobotCollisionConstraint.h`
+- `trajectory_tracking/src/local_planner.cpp`
+- `trajectory_generation/src/reference_path.cpp`
+- `trajectory_generation/src/path_smooth.cpp`
+
+- **46a**: Override MPC observation φ with reference trajectory direction when
+  robot speed < 0.3 m/s. For an omnidirectional robot, velocity heading is
+  undefined when stationary; using ref direction eliminates the "curve from
+  gimbal direction" artifact.
+  ```cpp
+  if (line_speed < 0.3 && !localplanner->ref_phi.empty()) {
+      sentry_state(3) = localplanner->ref_phi[0];
+      velocity_heading_ = localplanner->ref_phi[0];
+  }
+  ```
+
+- **46b**: Removed `robot_lidar_yaw` from velocity heading initialization
+  fallback. Now uses `0.0` as neutral placeholder instead of gimbal yaw.
+
+- **46c**: Enhanced diagnostic logging with `[Fix46]` prefix showing both
+  frames, refPhi0, and observation override status.
+
+- **46d**: Fixed polynomial timing in `solveTrapezoidalTime()`:
+  Changed `double time = 0.3 / desire_velocity` to
+  `double time = path_distance / desire_velocity`. This uses the actual
+  segment length instead of a hardcoded 0.3m, fixing the 8m segment
+  getting 0.189s duration.
+
+- **46e**: Added intermediate point insertion in `pathResample()` for
+  short paths (≤4 points) with long segments (>0.6m). Resamples at 0.3m
+  intervals so the polynomial solver has proper timing.
+  Result: 2-point 8.3m path → 28 properly-spaced waypoints.
+
+- **46f**: Reduced collision thresholds and barrier penalty for narrow
+  corridors:
+  | Parameter | Fix 44 | Fix 46 |
+  |-----------|--------|--------|
+  | distance_threshold_ (static) | 0.36 (0.6m) | **0.04** (0.2m) |
+  | distance_threshold_dynamic_ | 0.64 (0.8m) | **0.16** (0.4m) |
+  | Total clearance (static) | 0.9m | **0.5m** |
+  | Total clearance (dynamic) | 1.1m | **0.7m** |
+  | Barrier μ | 40 | **20** |
+  | Barrier δ | 1.0 | **0.5** |
+
+### Results
+
+| Metric | Pre-Fix 46 | Fix 46 |
+|--------|-----------|--------|
+| refGap (robot→ref[0]) | 8.039m | **0.006-0.76m** |
+| Polynomial path points | 4 | **59-69** |
+| MPC v_ctrl output | 0.000 m/s | **0.08-0.31 m/s** |
+| cmd_vel (gimbal frame) | [0, 0] | **[0.016, -0.142]** |
+| Fix 46a override active | N/A | ✓ (obs_phi=ref_phi) |
+| Frame rotations | ✓ (Fix 45a/b) | ✓ |
+
+### Remaining
+
+- Robot position not changing → needs SLAM initial pose via rviz 2D Pose Estimate
+- DISPENSE stuck-detection triggers due to low measured speed (avg < 0.05 m/s)
+- Topo search "No Path" for some goals — robot position may not be on topo graph
+
+---
+
+## Fix 47 — smoothTopoPath Safety Margin + Convergence
+
+**Date**: 2026-03-22  
+**Files**: `trajectory_generation/src/Astar_searcher.cpp`, `trajectory_generation/include/Astar_searcher.h`  
+**Build**: ✅ catkin_make exit 0
+
+### Root Cause
+
+The `smoothTopoPath()` greedy LOS pruning algorithm removed obstacle-avoiding
+intermediate waypoints when a direct shortcut didn't cross **inflated** cells.
+Since inflation extends exactly `robot_radius = 0.35 m` from obstacle surfaces, a
+shortcut passing 0.36 m from a wall was considered "collision-free", resulting in
+near-obstacle straight-line reference paths.  The MPC then detected these unsafe
+paths and produced near-zero velocity.
+
+### Changes
+
+- **47a**: Added `int cell_margin` parameter to `AstarPathFinder::lineVisib()`.
+  When `cell_margin > 0`, each ray sample checks ±margin cells in 4 cardinal
+  directions.  If ANY within-margin cell is occupied → shortcut rejected.
+  `smoothTopoPath()` now passes `cell_margin=3` (0.15 m buffer), so shortcuts
+  must clear obstacles by 0.35 + 0.15 = **0.50 m total**.
+
+- **47b**: Reduced smoothTopoPath iteration limit from 1000 to **500**.  When hit,
+  instead of returning the raw topo path (which may contain force-connect segments
+  through occupied cells), returns partial smooth path + remaining raw topo tail
+  nodes from the closest point to the current head position.
+
+### Test Results
+
+- Reference path verified as curved (~0.21 m max deviation from straight line)
+- No `[A Star ERROR] generated trajectory is not safe!` log message
+- Topo search + smooth + optimize completed in 0.046 s
+- Path desired time: 7.74 s
+
+---
+
+## Fix 48 — checkfeasible Dynamic-Only Obstacle Detection
+
+**Date**: 2026-03-22  
+**Files**: `trajectory_tracking/src/local_planner.cpp`  
+**Build**: ✅ catkin_make exit 0
+
+### Root Cause
+
+`LocalPlanner::checkfeasible()` used `isLocalOccupied()` which checks `l_data > 0`
+(live lidar data).  Since the active lidar sees **static walls** (not just dynamic
+obstacles), `l_data > 0` fires for every cell with lidar returns — including known
+walls.  This caused perpetual "MPC is not safe" warnings (every ~200 ms), filling
+the collision counter and triggering replan every 3–5 seconds.  The constant
+trajectory churn prevented the MPC from stabilizing.
+
+### Change
+
+Modified `checkfeasible()` to skip cells also present in the **inflated static map**
+(`data[flat] == 1`).  Only cells where `l_data > 0 AND data != 1` (dynamic-only
+obstacles not in the known map) trigger the collision flag:
+
+```cpp
+if (global_map->isLocalOccupied(idx, idy, idz)) {
+    int flat = idx * global_map->GLY_SIZE + idy;
+    if (global_map->data[flat] == 1)
+        continue;  // known static wall — skip
+    return true;   // dynamic-only obstacle — flag collision
+}
+```
+
+### Limitation
+
+In the test environment, the competition map doesn't match the real surroundings
+(desk, equipment, etc.).  Objects visible to the lidar but NOT in the competition map
+are correctly identified as "dynamic" but are actually static test-environment
+fixtures.  This causes continued false positives in the test environment.  On the
+competition field where the map matches reality, this fix should eliminate the false
+positive rate for static walls.
+
+### Current Status
+
+Fix 47+48 compiled and verified.  Reference path shows obstacle-avoiding curvature.
+MPC velocity output improved (v=0.472 m/s observed in some frames), but test
+environment mismatch limits full verification.  Competition-field testing recommended.
+
+---
+
+## Fix 49 — Guard Point Density + Sampling + Path Clearance
+
+**Date**: 2026-03-22  
+**Files**: `trajectory_generation/include/TopoSearch.h`, `trajectory_generation/src/TopoSearch.cpp`, `trajectory_generation/src/Astar_searcher.cpp`  
+**Build**: ✅ catkin_make exit 0
+
+### Root Cause
+
+Guard points were excessively dense (~200+ in a 20×20m map), causing Dijkstra to
+route through overshoot waypoints past the goal and producing reference path loops
+and twists.  Three guard creation paths had NO minimum inter-guard distance check:
+
+1. **Topo keypoints with no visible guards** (`visib_guards.size() < 1`): added
+   unconditionally as new guards with no distance check against existing guards.
+2. **Keypoints near start/end** (`near_terminal` flag): bypassed the
+   `min_distance > 2.0` threshold, allowing guards to cluster near endpoints.
+3. **Random samples with no visible guards**: added unconditionally as new guards
+   with no distance check.
+
+Only the narrow-corridor path (`visib_guards.size() == 1`) had a partial check
+(`min_distance < 0.5`).  The dense guard graph caused Dijkstra to find paths that
+overshot the goal (e.g., guard at (-3.61, -4.83) past goal at (-3.57, -4.91)),
+and `smoothTopoPath()` produced zigzag trying to shortcut through the dense graph.
+The L-BFGS optimizer then preserved any topological loop in the smoothed path.
+
+### Changes
+
+#### 49a — Minimum Inter-Guard Spacing (`TopoSearch.h`, `TopoSearch.cpp`)
+
+Added helper function:
+```cpp
+bool TopoSearch::tooCloseToExistingGuard(const Eigen::Vector3d& pt,
+                                          double min_spacing) const {
+    for (auto& node : graph_) {
+        if (node->type == GUARD) {
+            double d = (node->pos.head<2>() - pt.head<2>()).norm();
+            if (d < min_spacing) return true;
+        }
+    }
+    return false;
+}
+```
+
+Applied `tooCloseToExistingGuard(pt, MIN_GUARD_SPACING=0.5)` as a gate on ALL
+guard creation paths in both `createGraph()` and `createLocalGraph()`:
+- Keypoint guards (visible and invisible cases)
+- Random sampling guards (invisible case)
+- Narrow corridor guards (obs_num ≥ 10/20 threshold)
+
+Removed `near_terminal` bypass of distance check.  Changed narrow-corridor check
+from `min_distance < 0.5` (hardcoded) to `min_distance < MIN_GUARD_SPACING`
+(consistent with all other paths).
+
+#### 49b — Reduced Sampling (`TopoSearch.cpp`)
+
+`max_sample_num`: 1000 → **500**.  Fewer random samples = fewer dense guard
+clusters, while still sufficient for graph connectivity in a 20×20m map.
+
+#### 49c — Reduced smoothTopoPath Safety Margin (`Astar_searcher.cpp`)
+
+`cell_margin` in `smoothTopoPath()` `lineVisib()` calls: 3 → **2** (0.15m → 0.10m
+extra clearance beyond inflation).  Allows more direct shortcut paths through the
+less-dense guard graph.
+
+### Parameter Tuning History
+
+| MIN_GUARD_SPACING | Guard Count | Result |
+|-------------------|-------------|--------|
+| 1.0m (first try) | 28 | Too sparse — Dijkstra routed wildly off-course |
+| 0.5m (final) | 38–42 | Good density — clean monotonic paths |
+
+### Test Results
+
+| Metric | Pre-Fix 49 | Post-Fix 49 |
+|--------|-----------|-------------|
+| Guard point count | ~200+ | **38–42** |
+| Reference path points | 360 (with loop) | **48–50** (monotonic) |
+| Reference path shape | Loop near goal (x oscillates -3.52→-3.33→-3.52) | **Smooth monotonic progression** |
+| Raw topo path | Overshoots goal by 0.25m | **Direct to goal, no overshoot** |
+| cmd_vel | Sometimes zero | **Non-zero (vx≈0.50, vy≈0.37)** |
+| Robot movement | Sluggish near goal | **Steady forward progress** |
+
+### Current Status
+
+Fix 49 compiled and verified live.  Guard density reduced ~5× with clean reference
+paths.  Robot moves consistently with non-zero cmd_vel.  All four original symptoms
+resolved: (1) reference path twists → eliminated, (2) dense guard points → 38–42,
+(3) packed guard clusters → minimum 0.5m spacing enforced, (4) cmd_vel zero →
+non-zero confirmed.
+
+> **See also:** [PLANNING_FIX_HISTORY_CONDENSED.md](PLANNING_FIX_HISTORY_CONDENSED.md) — all 49 fixes in <400 lines.
